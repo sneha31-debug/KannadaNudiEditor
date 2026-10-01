@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="Kannada Nudi" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <title>Kannada Nudi Editor (Web)</title>
+    <link rel="icon" type="image/png" href="Seal_of_Karnataka.png" />
+    <link rel="apple-touch-icon" href="nudi_logo.png" />
+    <base href="/" />
+    <link href="css/fonts.css" rel="stylesheet" />
+    <link href="css/app.css" rel="stylesheet" />
+    <link href="KannadaNudiWeb.styles.css" rel="stylesheet" />
+    <!-- Bootstrap 5 CSS -->
+    <link href="lib/bootstrap/bootstrap.min.css" rel="stylesheet" />
+    <!-- Bootstrap Icons -->
+    <link href="lib/bootstrap-icons/bootstrap-icons.min.css" rel="stylesheet" />
+    <!-- KaTeX for Formulas -->
+    <link href="lib/katex/katex.min.css" rel="stylesheet" />
+    <script src="lib/katex/katex.min.js"></script>
+    <!-- QuillJS -->
+    <link href="lib/quill/quill.snow.css" rel="stylesheet" />
+    <link href="lib/quill/quill-better-table.css" rel="stylesheet" />
+    <script src="lib/quill/quill.js"></script>
+    <script src="lib/quill/quill-better-table.min.js"></script>
+    <!-- DocShift for DocX Export -->
+    <script src="lib/docshift/docshift.min.js"></script>
+    <!-- Mammoth for DocX Import -->
+    <script src="lib/mammoth/mammoth.browser.min.js"></script>
+    <!-- Custom JS -->
+    <script src="js/speech.js"></script>
+    <script src="js/quillInterop.js?v=1.3"></script>
+</head>
+
+<body>
+    <div id="app">
+        <svg class="loading-progress">
+            <circle r="40%" cx="50%" cy="50%" />
+            <circle r="40%" cx="50%" cy="50%" />
+        </svg>
+        <div class="loading-progress-text">Loading...</div>
+    </div>
+
+    <script src="_framework/blazor.webassembly.js"></script>
+    <!-- Bootstrap 5 JS Bundle -->
+    <script src="lib/bootstrap/bootstrap.bundle.min.js"></script>
+</body>
+
+</html>

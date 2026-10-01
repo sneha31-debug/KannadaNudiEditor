@@ -1,0 +1,728 @@
+window.quillInterop = {
+    quill: null,
+    dotNetRef: null,
+    lastKeyHandledTime: 0,
+    lastProcessedKey: null,
+    lastProcessedTime: 0,
+    lastProcessedSource: null,
+    _processingBackspace: false,
+    lastSelection: null,
+    _isPasting: false,
+
+    // Returns true if the string contains any Kannada Unicode character (U+0C80–U+0CFF).
+    // Used to detect OS-level Kannada keyboard input so we can bypass transliteration.
+    _isKannadaText: function(text) {
+        if (!text) return false;
+        for (let i = 0; i < text.length; i++) {
+            const cp = text.codePointAt(i);
+            if (cp >= 0x0C80 && cp <= 0x0CFF) return true;
+            if (cp > 0xFFFF) i++; // skip surrogate pair second unit
+        }
+        return false;
+    },
+
+    init: function (elementId, dotNetReference) {
+        if (!window.Quill) {
+            console.error("Quill JS not found");
+            return;
+        }
+
+        console.log("Initializing Quill on", elementId);
+        this.dotNetRef = dotNetReference;
+
+        // Register custom fonts
+        var Font = Quill.import('formats/font');
+        Font.whitelist = ['smartnudi1', 'nudiparijatha', 'nudi-01-e', 'nudi-01-k', 'nudi-02-e', 'nudi-05-e', 'nudi-10-e'];
+        Quill.register(Font, true);
+
+        // Register Quill Better Table
+        var modulesConfig = {
+            toolbar: [
+                [{ 'font': Font.whitelist }, { 'size': [] }],
+                ['bold', 'italic', 'underline', 'strike'],
+                [{ 'color': [] }, { 'background': [] }],
+                [{ 'script': 'sub' }, { 'script': 'super' }],
+                [{ 'header': 1 }, { 'header': 2 }, 'blockquote', 'code-block'],
+                [{ 'header': [1, 2, 3, 4, 5, 6, false] }],
+                [{ 'list': 'ordered' }, { 'list': 'bullet' }, { 'indent': '-1' }, { 'indent': '+1' }],
+                [{ 'direction': 'rtl' }, { 'align': [] }],
+                ['link', 'image', 'video', 'formula'],
+                ['clean']
+            ]
+        };
+
+        // Check for window.quillBetterTable (camelCase) as that's what the library exports
+        // Also check PascalCase as a fallback
+        var BetterTable = window.quillBetterTable || window.QuillBetterTable;
+
+        if (BetterTable) {
+            // Handle ESM/UMD mismatch where class might be in .default
+            if (typeof BetterTable !== 'function' && BetterTable.default) {
+                BetterTable = BetterTable.default;
+            }
+
+            if (typeof BetterTable === 'function') {
+                Quill.register({
+                    'modules/better-table': BetterTable
+                }, true);
+
+                modulesConfig['better-table'] = {
+                    operationMenu: {
+                        items: {
+                            unmergeCells: {
+                                text: 'Unmerge Cells'
+                            }
+                        }
+                    }
+                };
+
+                if (BetterTable.keyboardBindings) {
+                    modulesConfig.keyboard = {
+                        bindings: BetterTable.keyboardBindings
+                    };
+                }
+            } else {
+                console.error("quillBetterTable found but not a valid constructor", BetterTable);
+            }
+        } else {
+            console.warn("quillBetterTable not found. Make sure the script is loaded.");
+        }
+
+        this.quill = new Quill(elementId, {
+            theme: 'snow',
+            modules: modulesConfig
+        });
+
+        // Set SmartNudi1 as the default font for new content
+        this.quill.format('font', 'smartnudi1');
+
+        // Mobile: Hide toolbar on focus (Keyboard Active)
+        const toolbar = document.getElementById('main-toolbar');
+        if (toolbar && this.quill.root) {
+             this.quill.root.addEventListener('focus', () => {
+                 toolbar.classList.add('hide-on-mobile');
+             });
+             this.quill.root.addEventListener('blur', () => {
+                 toolbar.classList.remove('hide-on-mobile');
+             });
+        }
+
+        // Disable predictive text features to prevent mobile keyboard interference
+        if (this.quill.root) {
+            this.quill.root.setAttribute('autocomplete', 'off');
+            this.quill.root.setAttribute('autocorrect', 'off');
+            this.quill.root.setAttribute('autocapitalize', 'off');
+            this.quill.root.setAttribute('spellcheck', 'false');
+            this.quill.root.setAttribute('data-gramm', 'false');
+            this.quill.root.setAttribute('data-gramm_editor', 'false');
+            this.quill.root.setAttribute('data-enable-grammarly', 'false');
+            this.quill.root.setAttribute('aria-autocomplete', 'none');
+        }
+
+        this.quill.on('selection-change', function(range, oldRange, source) {
+            if (range) {
+                window.quillInterop.lastSelection = range;
+            }
+            // Prevent buffer clearing if we just handled a key/input event recently
+            // Increased timeout to 2000ms to handle slower mobile typing/rendering updates
+            if (Date.now() - window.quillInterop.lastKeyHandledTime < 2000) {
+                console.log("Ignoring selection change due to recent input");
+                return;
+            }
+
+            if (source === 'user' && dotNetReference) {
+                dotNetReference.invokeMethodAsync('OnSelectionChanged');
+            }
+        });
+
+        // Mobile Input Support via text-change (Fallback)
+        this.quill.on('text-change', (delta, oldDelta, source) => {
+            if (source === 'user' && window.isKannadaMode) {
+                if (window.quillInterop._isPasting) {
+                    return; // Skip transliterating pasted content
+                }
+                if (!this.dotNetRef) return;
+
+                let index = 0;
+                let handled = false;
+
+                // Iterate ops to find the operation and its position
+                for (let i = 0; i < delta.ops.length; i++) {
+                    const op = delta.ops[i];
+                    if (op.retain) {
+                        index += op.retain;
+                    } else if (op.insert && typeof op.insert === 'string') {
+                        // Handle single character insertions (excluding newlines)
+                        if (op.insert.length === 1 && op.insert !== '\n') {
+
+                            // If already a Kannada Unicode char (OS Kannada keyboard), leave it as-is
+                            if (window.quillInterop._isKannadaText(op.insert)) {
+                                index += op.insert.length;
+                                continue;
+                            }
+
+                            // Revert the user's insertion immediately by deleting it
+                            // We do this BEFORE deduplication check because if beforeinput failed to preventDefault,
+                            // the text IS in the editor and needs to be removed.
+                            this.quill.deleteText(index, op.insert.length, 'silent');
+
+                            // Deduplication Check: If handled by beforeinput or keydown recently, skip
+                            if ((window.quillInterop.lastProcessedSource === 'beforeinput' || window.quillInterop.lastProcessedSource === 'keydown') &&
+                                Date.now() - window.quillInterop.lastProcessedTime < 200 &&
+                                window.quillInterop.lastProcessedKey === op.insert) {
+                                console.log("Skipping duplicate input from text-change:", op.insert);
+                                handled = true;
+                                break;
+                            }
+
+                            // Update timestamp to prevent selection-change from clearing buffer
+                            this.lastKeyHandledTime = Date.now();
+
+                            // Send the character to C# for transliteration
+                            this.dotNetRef.invokeMethodAsync('ProcessKannadaKey', op.insert);
+
+                            // Update state
+                            window.quillInterop.lastProcessedKey = op.insert;
+                            window.quillInterop.lastProcessedTime = Date.now();
+                            window.quillInterop.lastProcessedSource = 'text-change';
+
+                            handled = true;
+                            break;
+                        }
+                        index += op.insert.length;
+                    } else if (op.delete) {
+                         // Check if this deletion was already handled by keydown/beforeinput
+                         const now = Date.now();
+                         if (now - this.lastKeyHandledTime > 200 && !window.quillInterop._processingBackspace) {
+                             // Update timestamp
+                             this.lastKeyHandledTime = Date.now();
+
+                             if (op.delete > 1) {
+                                 // Bulk deletion: Sync state by clearing buffer
+                                 this.dotNetRef.invokeMethodAsync('OnSelectionChanged');
+                             } else {
+                                 // Single char deletion: Try to process backspace logic
+                                 window.quillInterop._processingBackspace = true;
+                                 this.dotNetRef.invokeMethodAsync('ProcessBackspace').then(() => {
+                                     window.quillInterop._processingBackspace = false;
+                                 }).catch(() => {
+                                     window.quillInterop._processingBackspace = false;
+                                 });
+                             }
+                             handled = true;
+                         }
+                         break;
+                    }
+                }
+            }
+        });
+
+        // Setup direct click handlers for Copy and Paste buttons to ensure they execute inside user gesture context
+        const btnCopy = document.getElementById('btn-copy');
+        const btnPaste = document.getElementById('btn-paste');
+        if (btnCopy) {
+            btnCopy.addEventListener('click', async (e) => {
+                e.preventDefault();
+                await window.quillInterop.copyText();
+            });
+        }
+        if (btnPaste) {
+            btnPaste.addEventListener('click', async (e) => {
+                e.preventDefault();
+                await window.quillInterop.pasteText();
+            });
+        }
+    },
+
+    insertText: function (text) {
+        if (this.quill) {
+            const range = this.quill.getSelection(true);
+            console.log("Inserting text:", text);
+
+            if (range) {
+                if (range.length > 0) {
+                    this.quill.deleteText(range.index, range.length);
+                }
+                this.quill.insertText(range.index, text, 'api');
+                this.quill.setSelection(range.index + text.length, 0, 'api');
+            } else {
+                this.quill.focus();
+                const len = this.quill.getLength();
+                this.quill.insertText(len - 1, text, 'api');
+                this.quill.setSelection(len - 1 + text.length, 0, 'api');
+            }
+        } else {
+            console.error("Quill instance null during insertText");
+        }
+    },
+
+    backspace: function (count) {
+        if (this.quill) {
+            let range = this.quill.getSelection(true);
+            if (!range) {
+                 this.quill.focus();
+                 range = this.quill.getSelection(true);
+            }
+
+            if (range && range.index >= count) {
+                console.log("Backspacing count:", count);
+                this.quill.deleteText(range.index - count, count, 'api');
+            } else {
+                console.warn("Backspacing failed: Invalid range or index", range, count);
+            }
+        }
+    },
+
+    getHtml: function () {
+        if (this.quill) {
+            return this.quill.root.innerHTML;
+        }
+        return "";
+    },
+
+    getText: function() {
+        if (this.quill) {
+            return this.quill.getText();
+        }
+        return "";
+    },
+
+    setHtml: function (html) {
+        if (this.quill) {
+            this.quill.clipboard.dangerouslyPasteHTML(html);
+        }
+    },
+
+    saveAsDocx: async function(filename, htmlContent) {
+        if (!window.docshift) {
+            console.error("DocShift library not loaded");
+            return;
+        }
+        try {
+            const blob = await window.docshift.toDocx(htmlContent);
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        } catch (error) {
+            console.error("Error generating DocX:", error);
+        }
+    },
+
+    downloadFile: function(filename, content, contentType) {
+        contentType = contentType || 'text/html';
+        const element = document.createElement('a');
+        const file = new Blob([content], {type: contentType});
+        element.href = URL.createObjectURL(file);
+        element.download = filename;
+        document.body.appendChild(element);
+        element.click();
+        document.body.removeChild(element);
+    },
+
+    // Input Interception Logic
+    registerKeyInterceptor: function (dotNetReference) {
+        const editorDiv = document.getElementById('quill-editor');
+
+        if(!editorDiv) {
+            console.error("Quill editor div not found during registration");
+            return;
+        }
+
+        console.log("Registering key interceptors on #quill-editor");
+
+        // Listen for paste event to disable transliteration during pasting
+        editorDiv.addEventListener('paste', (e) => {
+            console.log("Global paste event detected");
+            window.quillInterop._isPasting = true;
+            if (dotNetReference) {
+                dotNetReference.invokeMethodAsync('OnSelectionChanged'); // clear transliteration buffer
+            }
+            setTimeout(() => {
+                window.quillInterop._isPasting = false;
+            }, 150); // Keep it true long enough to bypass beforeinput and text-change events
+        }, true);
+
+        // --- TOUCH HANDLING ---
+        editorDiv.addEventListener('touchstart', (e) => {
+             if (window.isKannadaMode) {
+                 console.log("Touchstart detected: Syncing selection to clear buffer");
+                 // Explicitly notify C# of selection change to reset transliteration buffer
+                 // This handles cases where user manually taps to move cursor
+                 dotNetReference.invokeMethodAsync('OnSelectionChanged');
+             }
+        }, { passive: true });
+
+        // --- COMPOSITION HANDLING ---
+        editorDiv.addEventListener('compositionstart', (e) => {
+             // Just logging. Do NOT prevent default here on Safari.
+             console.log("Composition started");
+             if (window.isKannadaMode) {
+                 window.quillInterop.lastKeyHandledTime = Date.now();
+             }
+        }, true);
+
+        editorDiv.addEventListener('compositionend', (e) => {
+             console.log("Composition ended", e.data);
+             if (window.isKannadaMode) {
+                 window.quillInterop.lastKeyHandledTime = Date.now();
+             }
+        }, true);
+
+
+        // --- INPUT HANDLING ---
+        editorDiv.addEventListener('beforeinput', (e) => {
+             if (window.isKannadaMode) {
+                // If we are currently pasting, do not intercept/transliterate
+                if (window.quillInterop._isPasting || e.inputType === 'insertFromPaste') {
+                    window.quillInterop.lastKeyHandledTime = Date.now();
+                    if (dotNetReference) {
+                        dotNetReference.invokeMethodAsync('OnSelectionChanged'); // clear transliteration buffer
+                    }
+                    return;
+                }
+
+                // Update time for ANY input activity to prevent buffer clearing
+                window.quillInterop.lastKeyHandledTime = Date.now();
+
+                // Log for debugging
+                console.log("beforeinput:", e.inputType, e.data);
+
+                // Handle text insertion types (Typing, Predictive, Replacement)
+                // STRICTLY Check for types we want to intercept.
+                // Do NOT block 'insertParagraph' (Enter) or 'insertFromPaste' (Paste).
+                if (e.inputType === 'insertText' ||
+                    e.inputType === 'insertCompositionText' ||
+                    e.inputType === 'insertReplacementText') {
+
+                    // If the input is already Kannada Unicode (OS-level Kannada keyboard),
+                    // let the browser insert it natively and skip transliteration entirely.
+                    if (e.data && window.quillInterop._isKannadaText(e.data)) {
+                        window.quillInterop.lastKeyHandledTime = Date.now();
+                        dotNetReference.invokeMethodAsync('OnSelectionChanged'); // clear transliteration buffer
+                        return; // do NOT preventDefault — native insertion handles it
+                    }
+
+                    // Prevent the browser from inserting the text (English/Predictive)
+                    e.preventDefault();
+
+                    if (e.data) {
+                        const chars = Array.from(e.data);
+                        chars.forEach(char => {
+                             dotNetReference.invokeMethodAsync('ProcessKannadaKey', char);
+
+                             // Update state for deduplication
+                             window.quillInterop.lastProcessedKey = char;
+                             window.quillInterop.lastProcessedTime = Date.now();
+                             window.quillInterop.lastProcessedSource = 'beforeinput';
+                        });
+                    }
+                }
+
+                // Handle Backspace (deleteContentBackward)
+                else if (e.inputType === 'deleteContentBackward') {
+                    e.preventDefault();
+
+                    // Flag-based dedup: if keydown already fired ProcessBackspace, skip
+                    if (window.quillInterop._processingBackspace) {
+                        console.log("Ignoring beforeinput Backspace (already processing)");
+                        return;
+                    }
+
+                    console.log("beforeinput Backspace intercepted");
+                    window.quillInterop._processingBackspace = true;
+                    window.quillInterop.lastKeyHandledTime = Date.now();
+                    window.quillInterop.lastProcessedTime = Date.now();
+                    window.quillInterop.lastProcessedSource = 'beforeinput';
+
+                    dotNetReference.invokeMethodAsync('ProcessBackspace').then(() => {
+                        window.quillInterop._processingBackspace = false;
+                    }).catch(() => {
+                        window.quillInterop._processingBackspace = false;
+                    });
+                }
+             }
+        }, true); // Capture phase
+
+        // Keep keydown for special keys or older browsers
+        editorDiv.addEventListener('keydown', (e) => {
+            // Support keyboard shortcuts for copy/paste/cut natively or programmatically
+            const isShortcut = e.ctrlKey || e.metaKey;
+            if (isShortcut) {
+                const key = e.key.toLowerCase();
+                if (key === 'c') {
+                    const range = window.quillInterop.quill ? window.quillInterop.quill.getSelection() : null;
+                    if (range && range.length > 0) {
+                        // Let browser handle native copy of selected text (preserves formatting)
+                        return;
+                    }
+                    e.preventDefault();
+                    window.quillInterop.copyText();
+                    return;
+                }
+                if (key === 'v') {
+                    // Let browser handle native paste (avoids permission prompts and preserves formatting)
+                    return;
+                }
+                if (key === 'x') {
+                    const range = window.quillInterop.quill ? window.quillInterop.quill.getSelection() : null;
+                    if (range && range.length > 0) {
+                        // Let browser handle native cut of selected text
+                        return;
+                    }
+                    e.preventDefault();
+                    return;
+                }
+            }
+
+            if (window.isKannadaMode) {
+                window.quillInterop.lastKeyHandledTime = Date.now();
+
+                // Handle Backspace and Delete when there is a selection
+                if (e.key === 'Backspace' || e.key === 'Delete') {
+                    const range = window.quillInterop.quill ? window.quillInterop.quill.getSelection() : null;
+                    if (range && range.length > 0) {
+                        e.preventDefault();
+                        window.quillInterop.quill.deleteText(range.index, range.length, 'user');
+                        window.quillInterop.quill.setSelection(range.index, 0);
+                        if (dotNetReference) {
+                            dotNetReference.invokeMethodAsync('OnSelectionChanged');
+                        }
+                        return;
+                    }
+                }
+
+                // Handle Backspace via keydown (when there is no selection)
+                if (e.key === 'Backspace') {
+                    e.preventDefault();
+
+                    // Flag-based dedup: only one handler fires ProcessBackspace per keypress
+                    if (window.quillInterop._processingBackspace) {
+                        console.log("Ignoring duplicate Backspace (keydown)");
+                        return;
+                    }
+
+                    window.quillInterop._processingBackspace = true;
+                    window.quillInterop.lastKeyHandledTime = Date.now();
+                    window.quillInterop.lastProcessedTime = Date.now();
+                    window.quillInterop.lastProcessedSource = 'keydown';
+
+                    console.log("Processing Backspace via keydown");
+                    dotNetReference.invokeMethodAsync('ProcessBackspace').then(() => {
+                        window.quillInterop._processingBackspace = false;
+                    }).catch(() => {
+                        window.quillInterop._processingBackspace = false;
+                    });
+
+                    return;
+                }
+
+                // Handle Delete via keydown (when there is no selection)
+                if (e.key === 'Delete') {
+                    // Let native delete happen, but clear the transliteration buffer
+                    if (dotNetReference) {
+                        dotNetReference.invokeMethodAsync('OnSelectionChanged');
+                    }
+                    return;
+                }
+
+                if (e.ctrlKey || e.altKey || e.metaKey) {
+                    return; // Let default happen for shortcuts
+                }
+            }
+        }, true);
+    },
+
+    setKannadaMode: function (val) {
+        console.log("Setting Kannada Mode:", val);
+        window.isKannadaMode = val;
+    },
+
+    undo: function() {
+        if (this.quill) this.quill.history.undo();
+    },
+
+    redo: function() {
+        if (this.quill) this.quill.history.redo();
+    },
+
+    copyText: async function() {
+        if (!this.quill) return;
+        this.quill.focus();
+        
+        let range = this.quill.getSelection() || window.quillInterop.lastSelection;
+        let text = "";
+        
+        if (range && range.length > 0) {
+            text = this.quill.getText(range.index, range.length);
+        } else {
+            text = this.quill.getText();
+        }
+
+        if (!text) return;
+
+        try {
+            // First try modern clipboard API
+            await navigator.clipboard.writeText(text);
+            console.log('Text copied to clipboard via Clipboard API');
+            return;
+        } catch (err) {
+            console.warn('Clipboard API writeText failed, trying execCommand:', err);
+        }
+
+        try {
+            // Fallback to execCommand copy
+            const successful = document.execCommand('copy');
+            if (successful) {
+                console.log('Text copied via execCommand');
+            } else {
+                console.warn('execCommand copy returned false');
+            }
+        } catch (err) {
+            console.error('execCommand copy failed:', err);
+        }
+    },
+
+    pasteText: async function() {
+        if (!this.quill) return;
+        window.quillInterop._isPasting = true;
+        try {
+            this.quill.focus();
+            let range = this.quill.getSelection(true) || window.quillInterop.lastSelection;
+            
+            // Try Async Clipboard API for HTML (Rich Text)
+            try {
+                const items = await navigator.clipboard.read();
+                for (const item of items) {
+                    if (item.types.includes('text/html')) {
+                        const blob = await item.getType('text/html');
+                        const html = await blob.text();
+
+                        if (range) {
+                            this.quill.deleteText(range.index, range.length);
+                            this.quill.clipboard.dangerouslyPasteHTML(range.index, html);
+                            this.quill.setSelection(range.index + html.length, 0);
+                        } else {
+                            const len = this.quill.getLength();
+                            this.quill.clipboard.dangerouslyPasteHTML(len - 1, html);
+                        }
+                        return; // Success
+                    }
+                }
+            } catch (err) {
+                console.warn('Clipboard.read() failed or permission denied, falling back to text', err);
+            }
+
+            // Fallback to plain text
+            try {
+                const text = await navigator.clipboard.readText();
+                if (range) {
+                    this.quill.deleteText(range.index, range.length);
+                    this.quill.insertText(range.index, text);
+                    this.quill.setSelection(range.index + text.length, 0);
+                } else {
+                    const len = this.quill.getLength();
+                    this.quill.insertText(len - 1, text);
+                }
+            } catch (err) {
+                console.error('Failed to paste: ', err);
+            }
+        } finally {
+            setTimeout(() => {
+                window.quillInterop._isPasting = false;
+            }, 100);
+        }
+    },
+
+    cutText: async function() {
+        if (!this.quill) return;
+        this.quill.focus();
+        
+        let range = this.quill.getSelection() || window.quillInterop.lastSelection;
+        if (range && range.length > 0) {
+            const text = this.quill.getText(range.index, range.length);
+            try {
+                await navigator.clipboard.writeText(text);
+                this.quill.deleteText(range.index, range.length, 'user');
+                console.log('Text cut to clipboard');
+            } catch (err) {
+                console.error('Failed to cut: ', err);
+            }
+        }
+    },
+
+    insertTable: function(rows, cols) {
+        if (!this.quill) return;
+        const module = this.quill.getModule('better-table');
+        if (module) {
+            module.insertTable(rows, cols);
+        } else {
+             console.error("Better Table module not found or not initialized");
+        }
+    },
+
+    toggleHighlight: function() {
+        if (!this.quill) return;
+        const range = this.quill.getSelection(true);
+        if (range) {
+            const format = this.quill.getFormat(range);
+            if (format.background === '#ffff00') {
+                this.quill.format('background', false);
+            } else {
+                this.quill.format('background', '#ffff00');
+            }
+        }
+    },
+
+    docToHtml: async function(fileBytes) {
+        if (!window.mammoth) {
+            console.error("Mammoth library not loaded");
+            return "";
+        }
+        try {
+            // fileBytes comes as a Uint8Array from Blazor
+            const result = await window.mammoth.convertToHtml({ arrayBuffer: fileBytes.buffer });
+            return result.value;
+        } catch (error) {
+            console.error("Error converting DocX:", error);
+            throw error;
+        }
+    },
+
+    isAppleDevice: function() {
+        return /Mac|iPod|iPhone|iPad/.test(navigator.platform) ||
+               /Mac|iPod|iPhone|iPad/.test(navigator.userAgent) ||
+               (navigator.userAgent.includes("Mac") && navigator.maxTouchPoints > 0);
+    },
+
+    getSelectedText: function() {
+        if (this.quill) {
+            const range = this.quill.getSelection();
+            if (range && range.length > 0) {
+                return this.quill.getText(range.index, range.length);
+            }
+        }
+        return "";
+    },
+
+    replaceSelection: function(text) {
+        if (this.quill) {
+            const range = this.quill.getSelection(true);
+            if (range) {
+                this.quill.deleteText(range.index, range.length);
+                this.quill.insertText(range.index, text);
+                this.quill.setSelection(range.index + text.length, 0);
+            }
+        }
+    },
+
+    setText: function(text) {
+        if (this.quill) {
+            this.quill.setText(text);
+        }
+    }
+};
